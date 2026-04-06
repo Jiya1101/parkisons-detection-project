@@ -25,9 +25,19 @@ except ImportError:
     sd = None
     print("[WARN] sounddevice not available — mic streaming disabled.")
 
-from preprocess import reduce_noise, normalize_amplitude, clip_silence
+from preprocess import (
+    reduce_noise,
+    normalize_amplitude,
+    clip_silence,
+    select_stable_voiced_segment,
+)
 from feature_extraction import extract_features
-from anfis_model import ANFIS
+from anfis_model import (
+    ANFIS,
+    apply_output_calibration,
+    score_input_reliability,
+    temper_risk_by_reliability,
+)
 from utils.helpers import MODELS_DIR
 
 
@@ -91,6 +101,18 @@ class RealtimeInference:
         self.scaler.scale_ = ckpt["scaler_scale"]
         self.scaler.var_ = ckpt["scaler_scale"] ** 2
         self.scaler.n_features_in_ = len(self.sel_idx)
+        self.calibration = {
+            "coef": ckpt.get("calibration_coef", 1.0),
+            "intercept": ckpt.get("calibration_intercept", 0.0),
+        }
+        self.feature_profile = None
+        if "feature_p01" in ckpt and "feature_p99" in ckpt:
+            self.feature_profile = {
+                "p01": ckpt["feature_p01"],
+                "p99": ckpt["feature_p99"],
+                "abs_z_p95": ckpt.get("feature_abs_z_p95", 2.5),
+                "abs_z_p99": ckpt.get("feature_abs_z_p99", 4.0),
+            }
 
         print(f"[INFO] Model loaded from {model_path}")
         print(f"[INFO] Selected features: {self.sel_names}")
@@ -173,6 +195,7 @@ class RealtimeInference:
         audio = reduce_noise(audio_chunk, self.sr)
         audio = clip_silence(audio, self.sr)
         audio = normalize_amplitude(audio)
+        audio = select_stable_voiced_segment(audio, self.sr, target_sec=2.5)
 
         # Extract features
         feats = extract_features(audio, sr=self.sr)
@@ -185,11 +208,23 @@ class RealtimeInference:
         # Inference
         with torch.no_grad():
             x_t = torch.tensor(vec_scaled, dtype=torch.float32)
-            risk = self.model(x_t).item()
+            raw_risk = self.model(x_t).item()
+        calibrated_risk = float(apply_output_calibration(raw_risk, self.calibration))
+        reliability = score_input_reliability(vec_scaled[0], self.feature_profile)
+        risk = float(temper_risk_by_reliability(calibrated_risk, reliability["reliability"]))
+        if reliability["reliability"] < 0.45:
+            risk = 0.50
 
         dt = (time.time() - t0) * 1000
         if dt > 100:
             print(f"  [WARN] Inference took {dt:.0f} ms (target <100 ms)")
+
+        if reliability["reliability"] < 0.45:
+            print(
+                f"  [WARN] Low confidence input "
+                f"(reliability={reliability['reliability']:.0%}, "
+                f"outside={reliability['n_outside']}/{len(self.sel_idx)})"
+            )
 
         return risk
 

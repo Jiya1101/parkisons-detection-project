@@ -33,7 +33,12 @@ from utils.helpers import (
 )
 from preprocess import load_and_preprocess, load_and_preprocess_bytes
 from feature_extraction import extract_features
-from anfis_model import ANFIS
+from anfis_model import (
+    ANFIS,
+    apply_output_calibration,
+    score_input_reliability,
+    temper_risk_by_reliability,
+)
 from explainability import (
     extract_fuzzy_rules,
     compute_feature_importance,
@@ -175,6 +180,17 @@ def load_models():
         sc.var_ = ckpt["scaler_scale"] ** 2
         sc.n_features_in_ = len(ckpt["sel_idx"])
         models["anfis_scaler"] = sc
+        models["anfis_calibration"] = {
+            "coef": ckpt.get("calibration_coef", 1.0),
+            "intercept": ckpt.get("calibration_intercept", 0.0),
+        }
+        if "feature_p01" in ckpt and "feature_p99" in ckpt:
+            models["anfis_feature_profile"] = {
+                "p01": ckpt["feature_p01"],
+                "p99": ckpt["feature_p99"],
+                "abs_z_p95": ckpt.get("feature_abs_z_p95", 2.5),
+                "abs_z_p99": ckpt.get("feature_abs_z_p99", 4.0),
+            }
 
     # Full scaler
     scaler_path = os.path.join(MODELS_DIR, "scaler.pkl")
@@ -222,6 +238,88 @@ def classify_feature(name, value):
         lo, hi = FEATURE_NORMAL_RANGES[name]
         return "normal" if lo <= value <= hi else "abnormal"
     return "unknown"
+
+
+def _score_anfis_sample(anfis, vec_scaled, calibration=None, feature_profile=None):
+    with torch.no_grad():
+        raw_risk = anfis(torch.tensor(vec_scaled, dtype=torch.float32)).item()
+
+    calibrated_risk = float(apply_output_calibration(raw_risk, calibration))
+    reliability = score_input_reliability(vec_scaled[0], feature_profile)
+    displayed_risk = float(
+        temper_risk_by_reliability(calibrated_risk, reliability["reliability"])
+    )
+    return {
+        "raw_risk": raw_risk,
+        "calibrated_risk": calibrated_risk,
+        "displayed_risk": displayed_risk,
+        **reliability,
+    }
+
+
+def _confidence_state(score_info):
+    rel = score_info["reliability"]
+    if rel < 0.45:
+        return "low", "Insufficient Confidence", "risk-mod"
+    if rel < 0.70:
+        return "moderate", "Low Confidence", "risk-mod"
+    label, css = _risk_label(score_info["displayed_risk"])
+    return "high", label, css
+
+
+def _recording_quality_summary(prep, feature_vector, feature_names, sel_idx, score_info):
+    duration = float(prep["duration"])
+    duration_ok = 1.5 <= duration <= 3.5
+
+    abnormal_count = 0
+    for i, name in enumerate(feature_names):
+        if classify_feature(name, float(feature_vector[i])) == "abnormal":
+            abnormal_count += 1
+
+    selected_feature_names = [feature_names[i] for i in sel_idx]
+    selected_abnormal = 0
+    for i in sel_idx:
+        if classify_feature(feature_names[i], float(feature_vector[i])) == "abnormal":
+            selected_abnormal += 1
+
+    rel = float(score_info["reliability"])
+    outside_count = int(score_info["n_outside"])
+    max_abs_z = float(score_info["max_abs_z"])
+
+    if rel < 0.45:
+        quality_label = "Poor"
+        quality_color = "risk-high"
+    elif rel < 0.70 or not duration_ok:
+        quality_label = "Fair"
+        quality_color = "risk-mod"
+    else:
+        quality_label = "Good"
+        quality_color = "risk-low"
+
+    reasons = []
+    if not duration_ok:
+        reasons.append("Recording length is outside the ideal 1.5-3.5s window.")
+    if outside_count > max(2, len(sel_idx) // 4):
+        reasons.append("Too many selected features fall outside the training range.")
+    if max_abs_z > 3.5:
+        reasons.append("The recording is unusually far from the model's scaled feature distribution.")
+    if selected_abnormal > max(3, len(sel_idx) // 3):
+        reasons.append("Many of the most important voice biomarkers are flagged as abnormal.")
+    if not reasons:
+        reasons.append("The recording shape is reasonably close to the training distribution.")
+
+    return {
+        "quality_label": quality_label,
+        "quality_color": quality_color,
+        "duration_ok": duration_ok,
+        "abnormal_count": abnormal_count,
+        "selected_abnormal": selected_abnormal,
+        "selected_total": len(sel_idx),
+        "outside_count": outside_count,
+        "max_abs_z": max_abs_z,
+        "reasons": reasons,
+        "selected_feature_names": selected_feature_names,
+    }
 
 
 # ─── Main App ───────────────────────────────────────────────────────────────
@@ -349,26 +447,34 @@ def main():
         anfis = models["anfis"]
         sel_idx = models["anfis_sel_idx"]
         anfis_scaler = models["anfis_scaler"]
+        calibration = models.get("anfis_calibration")
+        feature_profile = models.get("anfis_feature_profile")
 
         vec_sel = feature_vector[sel_idx]
         vec_scaled = anfis_scaler.transform(vec_sel.reshape(1, -1))
-        with torch.no_grad():
-            risk_score = anfis(
-                torch.tensor(vec_scaled, dtype=torch.float32)
-            ).item()
+        score_info = _score_anfis_sample(
+            anfis,
+            vec_scaled,
+            calibration=calibration,
+            feature_profile=feature_profile,
+        )
+        quality_info = _recording_quality_summary(
+            prep,
+            feature_vector,
+            feature_names,
+            sel_idx,
+            score_info,
+        )
+        confidence_level, assessment_text, assessment_css = _confidence_state(score_info)
+        risk_score = score_info["displayed_risk"] if confidence_level != "low" else 0.50
 
         # ── KPI Row ──────────────────────────────────────────────
-        label, label_cls = _risk_label(risk_score)
         st.markdown(
             f"""
             <div class='kpi-row'>
                 <div class='kpi-card'>
                     <div class='value'>{risk_score:.1%}</div>
-                    <div class='label'>ANFIS Risk Score</div>
-                </div>
-                <div class='kpi-card'>
-                    <div class='value {label_cls}'>{label}</div>
-                    <div class='label'>Assessment</div>
+                    <div class='label'>Confidence-Aware Risk</div>
                 </div>
                 <div class='kpi-card'>
                     <div class='value'>{prep["duration"]:.1f}s</div>
@@ -383,12 +489,42 @@ def main():
             unsafe_allow_html=True,
         )
 
+        rel = score_info["reliability"]
+        if rel < 0.45:
+            st.warning(
+                "This recording is outside the model's reliable operating range. "
+                "The gauge is being held at neutral instead of showing a misleading risk."
+            )
+            st.markdown(
+                "- Use a steady sustained `aah` for 2-3 seconds\n"
+                "- Keep the microphone distance fixed\n"
+                "- Record in a quiet room with minimal echo\n"
+                "- Avoid whispering, shouting, or changing pitch mid-recording"
+            )
+        elif rel < 0.70:
+            st.info(
+                "Confidence is moderate: some selected voice features are outside the model's "
+                "usual training range, so treat this as a screening estimate rather than a probability."
+            )
+
+        st.caption(
+            f"Raw ANFIS score: {score_info['raw_risk']:.1%} | "
+            f"Calibrated score: {score_info['calibrated_risk']:.1%} | "
+            f"Reliability: {rel:.0%} | "
+            f"Out-of-range selected features: {score_info['n_outside']}/{len(sel_idx)}"
+        )
+
         # ── Gauge Chart ──────────────────────────────────────────
         col_gauge, col_rules = st.columns([1, 1])
 
         with col_gauge:
             st.markdown("<div class='section-head'>🎯 Risk Gauge</div>", unsafe_allow_html=True)
-            fig_gauge = create_gauge_chart(risk_score)
+            gauge_title = (
+                "Recording Confidence Too Low"
+                if confidence_level == "low"
+                else "Confidence-Aware Risk Score"
+            )
+            fig_gauge = create_gauge_chart(risk_score, title=gauge_title)
             st.plotly_chart(fig_gauge, use_container_width=True)
 
         with col_rules:
@@ -397,6 +533,34 @@ def main():
             rules = extract_fuzzy_rules(anfis, feature_names=sel_names, top_k=8)
             for r in rules:
                 st.markdown(f"<div class='rule-card'>{r}</div>", unsafe_allow_html=True)
+
+        st.markdown("<div class='section-head'>Recording Quality</div>", unsafe_allow_html=True)
+        q1, q2, q3, q4 = st.columns(4)
+        with q1:
+            st.metric("Quality", quality_info["quality_label"])
+        with q2:
+            st.metric("Reliability", f"{score_info['reliability']:.0%}")
+        with q3:
+            st.metric("Outside Range", f"{quality_info['outside_count']}/{len(sel_idx)}")
+        with q4:
+            st.metric("Max |Z|", f"{quality_info['max_abs_z']:.2f}")
+
+        st.markdown(
+            f"Assessment: <span class='{quality_info['quality_color']}'>{quality_info['quality_label']}</span>",
+            unsafe_allow_html=True,
+        )
+        for reason in quality_info["reasons"]:
+            st.markdown(f"- {reason}")
+
+        with st.expander("Why this recording was judged this way"):
+            st.markdown(
+                f"- Audio duration: `{prep['duration']:.2f}s` "
+                f"({'ideal' if quality_info['duration_ok'] else 'outside ideal range'})\n"
+                f"- Selected features outside training range: `{quality_info['outside_count']}/{len(sel_idx)}`\n"
+                f"- Abnormal biomarkers overall: `{quality_info['abnormal_count']}/{len(feature_names)}`\n"
+                f"- Abnormal biomarkers among selected inputs: "
+                f"`{quality_info['selected_abnormal']}/{quality_info['selected_total']}`"
+            )
 
         # ── Feature Table ────────────────────────────────────────
         st.markdown("<div class='section-head'>🧬 Extracted Biomarkers</div>", unsafe_allow_html=True)

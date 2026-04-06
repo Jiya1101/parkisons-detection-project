@@ -42,7 +42,13 @@ from utils.helpers import (
     plot_comparison_table,
     plot_feature_importance,
 )
-from anfis_model import ANFIS, select_top_features, pso_optimize_mf
+from anfis_model import (
+    ANFIS,
+    build_feature_profile,
+    fit_output_calibrator,
+    pso_optimize_mf,
+    select_top_features,
+)
 
 warnings.filterwarnings("ignore")
 
@@ -122,7 +128,7 @@ def train_anfis(X_train, y_train, feature_names, n_features=12, n_mfs=3, epochs=
     model.hybrid_train(
         X_scaled, y_train,
         epochs=epochs,
-        lr=0.01, 
+        lr=0.005,
         batch_size=32,
         verbose=True # Turn this to True so you can watch the Loss drop!
     )
@@ -141,7 +147,7 @@ def train_svm(X_train, y_train):
         param_grid,
         cv=3,
         scoring="accuracy",
-        n_jobs=-1,
+        n_jobs=1,
     )
     svm.fit(X_train, y_train)
     return svm.best_estimator_
@@ -158,7 +164,7 @@ def train_rf(X_train, y_train):
         param_grid,
         cv=3,
         scoring="accuracy",
-        n_jobs=-1,
+        n_jobs=1,
     )
     rf.fit(X_train, y_train)
     return rf.best_estimator_
@@ -349,6 +355,8 @@ def run_full_pipeline():
     # 1. Load data
     df = load_uci_dataset()
     X, y, feature_names = get_feature_matrix(df)
+    X_orig = X.copy()
+    y_orig = y.copy()
     
     # --- THE BIAS FIX (SMOTE) ---
     # We do this BEFORE printing the summary so the stats are accurate
@@ -380,6 +388,10 @@ def run_full_pipeline():
     anfis_model, sel_idx, anfis_scaler, sel_names = train_anfis(
         X, y, feature_names, n_features=12, n_mfs=3, epochs=350, use_pso=True,
     )
+    X_sel_orig = X_orig[:, sel_idx]
+    X_scaled_orig = anfis_scaler.transform(X_sel_orig)
+    calibration = fit_output_calibrator(anfis_model, X_scaled_orig, y_orig)
+    feature_profile = build_feature_profile(X_scaled_orig)
     torch.save(
         {
             "model_state": anfis_model.state_dict(),
@@ -390,6 +402,12 @@ def run_full_pipeline():
             "sel_names": sel_names,
             "scaler_mean": anfis_scaler.mean_,
             "scaler_scale": anfis_scaler.scale_,
+            "calibration_coef": calibration["coef"],
+            "calibration_intercept": calibration["intercept"],
+            "feature_p01": feature_profile["p01"],
+            "feature_p99": feature_profile["p99"],
+            "feature_abs_z_p95": feature_profile["abs_z_p95"],
+            "feature_abs_z_p99": feature_profile["abs_z_p99"],
         },
         os.path.join(MODELS_DIR, "anfis_model.pt"),
     )

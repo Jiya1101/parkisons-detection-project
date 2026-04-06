@@ -10,6 +10,18 @@ import librosa
 import noisereduce as nr
 
 
+def _finalize_preprocessed(audio: np.ndarray, sr: int, original_audio: np.ndarray) -> dict:
+    windows = segment_windows(audio, sr, win_ms=25, hop_ms=10)
+    duration = len(audio) / sr
+    return {
+        "audio": audio,
+        "sr": sr,
+        "duration": duration,
+        "windows": windows,
+        "original_audio": original_audio,
+    }
+
+
 def load_and_preprocess(wav_path: str, sr: int = 22050) -> dict:
     """
     Load and fully preprocess an audio file.
@@ -46,18 +58,11 @@ def load_and_preprocess(wav_path: str, sr: int = 22050) -> dict:
     # Step 3: Amplitude normalization
     audio = normalize_amplitude(audio)
 
-    # Step 4: Windowing
-    windows = segment_windows(audio, sr, win_ms=25, hop_ms=10)
+    # Step 4: Keep the most stable voiced vowel segment
+    audio = select_stable_voiced_segment(audio, sr, target_sec=2.5)
 
-    duration = len(audio) / sr
-
-    return {
-        "audio": audio,
-        "sr": sr,
-        "duration": duration,
-        "windows": windows,
-        "original_audio": original_audio,
-    }
+    # Step 5: Windowing
+    return _finalize_preprocessed(audio, sr, original_audio)
 
 
 def load_and_preprocess_bytes(audio_bytes: bytes, sr: int = 22050) -> dict:
@@ -90,17 +95,8 @@ def load_and_preprocess_bytes(audio_bytes: bytes, sr: int = 22050) -> dict:
     audio = reduce_noise(audio, sr)
     audio = clip_silence(audio, sr, threshold_db=-40)
     audio = normalize_amplitude(audio)
-    windows = segment_windows(audio, sr, win_ms=25, hop_ms=10)
-
-    duration = len(audio) / sr
-
-    return {
-        "audio": audio,
-        "sr": sr,
-        "duration": duration,
-        "windows": windows,
-        "original_audio": original_audio,
-    }
+    audio = select_stable_voiced_segment(audio, sr, target_sec=2.5)
+    return _finalize_preprocessed(audio, sr, original_audio)
 
 
 # ─── Individual Processing Steps ────────────────────────────────────────────
@@ -166,6 +162,95 @@ def clip_silence(
         return audio
 
     return trimmed
+
+
+def select_stable_voiced_segment(
+    audio: np.ndarray,
+    sr: int,
+    target_sec: float = 2.5,
+    frame_ms: int = 40,
+    hop_ms: int = 10,
+) -> np.ndarray:
+    """
+    Select the most stable voiced region from a sustained-vowel recording.
+
+    We score short frames using a mix of energy, low zero-crossing rate,
+    and pitch stability, then keep the best contiguous segment near target_sec.
+    """
+    target_len = int(sr * target_sec)
+    if len(audio) <= target_len:
+        return audio
+
+    frame_length = max(int(sr * frame_ms / 1000), 256)
+    hop_length = max(int(sr * hop_ms / 1000), 64)
+
+    rms = librosa.feature.rms(y=audio, frame_length=frame_length, hop_length=hop_length)[0]
+    zcr = librosa.feature.zero_crossing_rate(
+        y=audio, frame_length=frame_length, hop_length=hop_length
+    )[0]
+
+    try:
+        f0 = librosa.yin(
+            audio,
+            fmin=75.0,
+            fmax=500.0,
+            sr=sr,
+            frame_length=frame_length,
+            hop_length=hop_length,
+        )
+        voiced = np.isfinite(f0) & (f0 > 0)
+    except Exception:
+        f0 = np.zeros_like(rms)
+        voiced = np.zeros_like(rms, dtype=bool)
+
+    if len(rms) < 3:
+        start = max((len(audio) - target_len) // 2, 0)
+        return audio[start:start + target_len]
+
+    rms_norm = rms / (np.max(rms) + 1e-8)
+    zcr_norm = zcr / (np.max(zcr) + 1e-8)
+
+    f0_stability = np.zeros_like(rms_norm)
+    if voiced.any():
+        f0_safe = np.where(voiced, f0, np.nan)
+        for i in range(len(f0_safe)):
+            lo = max(0, i - 2)
+            hi = min(len(f0_safe), i + 3)
+            local = f0_safe[lo:hi]
+            if np.sum(np.isfinite(local)) >= 2:
+                mean_local = np.nanmean(local)
+                std_local = np.nanstd(local)
+                f0_stability[i] = 1.0 / (1.0 + std_local / (mean_local + 1e-6))
+
+    frame_score = (
+        0.55 * rms_norm +
+        0.25 * (1.0 - np.clip(zcr_norm, 0.0, 1.0)) +
+        0.20 * f0_stability
+    )
+    frame_score = np.where(voiced, frame_score + 0.15, frame_score - 0.25)
+
+    seg_frames = max(int(np.ceil((target_len - frame_length) / hop_length)) + 1, 1)
+    if len(frame_score) <= seg_frames:
+        return audio
+
+    best_idx = 0
+    best_score = -np.inf
+    for start_f in range(0, len(frame_score) - seg_frames + 1):
+        end_f = start_f + seg_frames
+        window_scores = frame_score[start_f:end_f]
+        voiced_ratio = float(np.mean(voiced[start_f:end_f])) if voiced.any() else 0.0
+        score = float(np.mean(window_scores)) + 0.35 * voiced_ratio
+        if score > best_score:
+            best_score = score
+            best_idx = start_f
+
+    start = best_idx * hop_length
+    end = min(start + target_len, len(audio))
+    segment = audio[start:end]
+
+    if len(segment) < int(sr * 1.0):
+        return audio
+    return segment
 
 
 def segment_windows(
