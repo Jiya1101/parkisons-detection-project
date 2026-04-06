@@ -23,6 +23,8 @@ import joblib
 from sklearn.model_selection import StratifiedKFold, GridSearchCV
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
+from imblearn.over_sampling import SMOTE
+
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (
     accuracy_score,
@@ -92,61 +94,37 @@ def _oversample_minority(X, y, ratio=0.8):
     return np.vstack(X_parts), np.concatenate(y_parts)
 
 
-def train_anfis(
-    X_train, y_train,
-    feature_names: list,
-    n_features: int = 12,       # more signal retained
-    n_mfs: int = 3,             # finer fuzzy granularity
-    epochs: int = 300,          # more convergence time
-    use_pso: bool = True,
-):
-    """
-    Select features → init from data → PSO → hybrid train → prune → fine-tune.
+def train_anfis(X_train, y_train, feature_names, n_features=12, n_mfs=3, epochs=300, use_pso=True):
+    # 1. Feature selection (Keep your existing logic)
+    X_sel, sel_names, sel_idx = select_top_features(X_train, y_train, feature_names, k=n_features)
 
-    Returns:
-        (model, selected_indices, scaler, selected_names)
-    """
-    # 1. Feature selection
-    X_sel, sel_names, sel_idx = select_top_features(
-        X_train, y_train, feature_names, k=n_features,
-    )
-
-    # 2. Scale
+    # 2. Scale - THIS IS CRITICAL
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X_sel)
 
     # 3. Build model
     model = ANFIS(n_inputs=n_features, n_mfs=n_mfs)
 
-    # 4. Init MF centers/widths from data percentiles
+    # 4. Init from data (Using our new FCM logic from the other file)
     model.init_from_data(X_scaled)
 
-    # 5. PSO initialisation with stronger search
+    # 5. PSO - We need this to find the best starting "shapes" for the fuzzy sets
     if use_pso:
         model = pso_optimize_mf(
             model, X_scaled, y_train,
-            n_particles=25,
-            iters=40,
-            verbose=False,
+            n_particles=15, # Slightly fewer particles for stability
+            iters=30,
+            verbose=False
         )
 
-    # 6. Main hybrid training
+    # 6. Main hybrid training - THIS IS WHERE THE RULES LEARN
+    # We use a slightly higher learning rate to ensure the rules move away from 0.5
     model.hybrid_train(
         X_scaled, y_train,
         epochs=epochs,
-        lr=0.005,
-        verbose=False,
-    )
-
-    # 7. Less aggressive pruning
-    model.prune_rules(X_scaled, threshold=0.002, keep_min=32)
-
-    # 8. Fine-tune after pruning with lower LR
-    model.hybrid_train(
-        X_scaled, y_train,
-        epochs=100,
-        lr=0.001,
-        verbose=False,
+        lr=0.01, 
+        batch_size=32,
+        verbose=True # Turn this to True so you can watch the Loss drop!
     )
 
     return model, sel_idx, scaler, sel_names
@@ -359,11 +337,10 @@ def cross_validate_all(
 def run_full_pipeline():
     """
     End-to-end pipeline:
-      1. Download / load UCI dataset
-      2. 10-fold CV on all models
+      1. Load UCI dataset & Balance with SMOTE
+      2. 5-fold CV on all models
       3. Train final models on full data
       4. Save models + scaler
-      5. Print results
     """
     print("=" * 60)
     print("  Parkinson's Disease Detection — Training Pipeline")
@@ -372,10 +349,19 @@ def run_full_pipeline():
     # 1. Load data
     df = load_uci_dataset()
     X, y, feature_names = get_feature_matrix(df)
-    print(f"\n  Features: {X.shape[1]}  |  Samples: {X.shape[0]}")
-    print(f"  PD: {int(y.sum())}  |  Healthy: {int(len(y) - y.sum())}\n")
+    
+    # --- THE BIAS FIX (SMOTE) ---
+    # We do this BEFORE printing the summary so the stats are accurate
+    print(f"\n[INFO] Original classes: PD={int(y.sum())}, Healthy={int(len(y) - y.sum())}")
+    
+    smote = SMOTE(random_state=42)
+    X, y = smote.fit_resample(X, y)
+    
+    print(f"[INFO] Balanced classes: PD={int(y.sum())}, Healthy={int(len(y) - y.sum())}")
+    print(f"  Total Samples after SMOTE: {X.shape[0]}\n")
+    # ----------------------------
 
-    # 2. Cross-validate
+    # 2. Cross-validate (using 5 folds as per your code)
     results_df = cross_validate_all(X, y, feature_names, n_folds=5)
 
     print("\n" + "=" * 60)

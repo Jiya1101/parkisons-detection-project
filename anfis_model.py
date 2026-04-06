@@ -13,6 +13,7 @@ import itertools
 import numpy as np
 import torch
 import torch.nn as nn
+import skfuzzy as  fuzz
 from sklearn.feature_selection import mutual_info_classif
 
 
@@ -69,15 +70,37 @@ class ANFIS(nn.Module):
         )
 
     def init_from_data(self, X: np.ndarray):
+        """
+        OPTIMIZED: Uses Fuzzy C-Means (FCM) Clustering instead of 
+        simple percentiles to find the natural 'centers' of the voice data.
+        """
         n_mfs = self.n_mfs
         with torch.no_grad():
             for i in range(self.n_inputs):
                 col = X[:, i]
-                percentiles = np.linspace(10, 90, n_mfs)
-                centers = np.percentile(col, percentiles)
+                
+                # --- SOFT COMPUTING IMPROVEMENT: FUZZY C-MEANS ---
+                # We tell the computer to find 'n_mfs' (e.g., 2 or 3) natural 
+                # clusters in the data for this specific voice feature.
+                # cntr = the centers of the clusters (e.g., the 'average' Low and High)
+                cntr, u, u0, d, jm, p, fpc = fuzz.cluster.cmeans(
+                    col.reshape(1, -1), c=n_mfs, m=2, error=0.005, maxiter=1000
+                )
+                
+                # We sort them so that index 0 is 'Low' and index 1 is 'High'
+                centers = np.sort(cntr.flatten())
                 self.mf.center.data[i] = torch.tensor(centers, dtype=torch.float32)
+                # ------------------------------------------------
+                
+                # We calculate the 'Spread' (width) of the curves.
+                # CRITICAL FIX: Divisor changed from 1.5 to 4.0.
+                # With scaled data, spread≈6, so sigma≈6/(4*3)=0.5.
+                # This keeps 'Low','Med','High' sharp and DISTINCT —
+                # adjacent MFs at distance ~3 apart will have near-zero
+                # overlap, giving each rule a unique firing strength
+                # instead of all firing at 1.0 and averaging to 0.50.
                 spread = max(col.max() - col.min(), 1e-3)
-                sigma_val = spread / (2.0 * n_mfs)
+                sigma_val = spread / (4.0 * n_mfs)
                 self.mf.log_sigma.data[i] = torch.full(
                     (n_mfs,), float(np.log(sigma_val + 1e-6))
                 )
@@ -137,6 +160,7 @@ class ANFIS(nn.Module):
                     x_aug = torch.cat([X_t, torch.ones(n, 1, device=device)], dim=1)
                     A = (w_bar.unsqueeze(-1) * x_aug.unsqueeze(1)).reshape(n, -1)
                     A_w = A * sample_weights.unsqueeze(-1).sqrt()
+                    # epsilon prevents log(0) / log(inf) NaN during LSE
                     y_logit = torch.log((y_t + 1e-6) / (1 - y_t + 1e-6))
                     y_logit_w = y_logit * sample_weights.sqrt()
                     try:
